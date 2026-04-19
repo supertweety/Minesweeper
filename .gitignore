@@ -1,0 +1,14 @@
+.venv/
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# Notebook and Python caches inside packages
+*/__pycache__/
+
+# Generated training artifacts
+*.pt
+*.pth
+
+# macOS metadata
+.DS_Store

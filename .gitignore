@@ -10,5 +10,12 @@ __pycache__/
 *.pt
 *.pth
 
+# Local files from the older RL exercise
+dqn_agent.py
+minesweeper_env.py
+policy_gradient_agents.py
+train_dqn.py
+minesweeper_dqn_demo.ipynb
+
 # macOS metadata
 .DS_Store

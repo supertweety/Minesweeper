@@ -1,2 +1,4 @@
-numpy
-torch
+# The tournament framework itself has no mandatory third-party dependencies.
+#
+# If you build a SAT-based agent, install PySAT separately:
+# python-sat

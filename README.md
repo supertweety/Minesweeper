@@ -1,8 +1,7 @@
 # Minesweeper Tournament Framework
 
 This repository now includes a small tournament package for turn-based Minesweeper agents.
-
-The original RL code is still here, but the new package is aimed at the next exercise: agents that reason about the board, for example with SAT solving or other symbolic methods.
+It is aimed at agents that reason about the board, for example with SAT solving or other symbolic methods.
 
 The package lives in [`minesweeper_tournament`](./minesweeper_tournament).
 

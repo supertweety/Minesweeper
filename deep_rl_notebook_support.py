@@ -8,6 +8,7 @@ learning-rate schedules.
 
 from __future__ import annotations
 
+import math
 import random
 from collections import deque
 from copy import deepcopy
@@ -308,26 +309,87 @@ def set_optimizer_lr(optimizer, learning_rate):
         group["lr"] = learning_rate
 
 
-class MLPQNetwork(nn.Module):
-    """Baseline network for DQN.
+class CNNQNetwork(nn.Module):
+    """Convolutional baseline for DQN.
 
-    This is intentionally plain. If you want to experiment, this is a
-    reasonable place to swap in a different architecture.
+    The environment still emits one flattened vector, but this network
+    reshapes it back into a board so it can use spatial structure.
+    The selected action is encoded as one extra input channel, and the
+    network predicts one scalar value Q(s, a).
     """
 
-    def __init__(self, input_size, output_size, hidden_sizes=(128, 64)):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        hidden_sizes=(128, 64),
+        channels_per_cell=MinesweeperEnv.CHANNELS_PER_CELL,
+        conv_channels=(32, 64),
+    ):
         super().__init__()
         hidden_one, hidden_two = hidden_sizes
-        self.layers = nn.Sequential(
-            nn.Linear(input_size, hidden_one),
+        conv_one, conv_two = conv_channels
+
+        self.channels_per_cell = channels_per_cell
+        cells = input_size // channels_per_cell
+        self.board_size = math.isqrt(cells)
+        if self.board_size * self.board_size * channels_per_cell != input_size:
+            raise ValueError(
+                "input_size must match board_size * board_size * channels_per_cell"
+            )
+
+        self.features = nn.Sequential(
+            nn.Conv2d(channels_per_cell + 1, conv_one, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(conv_one, conv_two, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+
+        conv_output_size = conv_two * self.board_size * self.board_size
+        self.head = nn.Sequential(
+            nn.Linear(conv_output_size, hidden_one),
             nn.ReLU(),
             nn.Linear(hidden_one, hidden_two),
             nn.ReLU(),
-            nn.Linear(hidden_two, output_size),
+            nn.Linear(hidden_two, 1),
         )
 
-    def forward(self, state):
-        return self.layers(state)
+    def forward(self, state, action):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if not torch.is_tensor(action):
+            action = torch.tensor(action, dtype=torch.long, device=state.device)
+        else:
+            action = action.to(device=state.device, dtype=torch.long)
+        if action.dim() == 0:
+            action = action.unsqueeze(0)
+
+        batch_size = state.shape[0]
+        if action.shape[0] != batch_size:
+            raise ValueError("state batch and action batch must have the same size")
+
+        x = state.reshape(
+            batch_size,
+            self.board_size,
+            self.board_size,
+            self.channels_per_cell,
+        )
+        x = x.permute(0, 3, 1, 2)
+        action_channel = torch.zeros(
+            batch_size,
+            1,
+            self.board_size,
+            self.board_size,
+            dtype=state.dtype,
+            device=state.device,
+        )
+        rows = torch.div(action, self.board_size, rounding_mode="floor")
+        cols = action % self.board_size
+        action_channel[torch.arange(batch_size, device=state.device), 0, rows, cols] = 1.0
+        x = torch.cat([x, action_channel], dim=1)
+        x = self.features(x)
+        x = x.reshape(batch_size, -1)
+        return self.head(x).squeeze(-1)
 
 
 class MLPPolicyNetwork(nn.Module):
@@ -427,8 +489,8 @@ class DQNAgent:
         self.episode_index = 0
         self.train_steps = 0
 
-        self.q_network = MLPQNetwork(state_size, action_size, hidden_sizes=self.hidden_sizes).to(self.device)
-        self.target_network = MLPQNetwork(state_size, action_size, hidden_sizes=self.hidden_sizes).to(self.device)
+        self.q_network = CNNQNetwork(state_size, action_size, hidden_sizes=self.hidden_sizes).to(self.device)
+        self.target_network = CNNQNetwork(state_size, action_size, hidden_sizes=self.hidden_sizes).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()
 
@@ -451,23 +513,36 @@ class DQNAgent:
         else:
             self.current_epsilon = 0.0
 
+    def _q_values_for_actions(self, network, state, actions):
+        if not actions:
+            return torch.empty(0, dtype=torch.float32, device=self.device)
+
+        if not torch.is_tensor(state):
+            state = torch.tensor(state, dtype=torch.float32, device=self.device)
+        else:
+            state = state.to(device=self.device, dtype=torch.float32)
+
+        if state.dim() == 1:
+            states = state.unsqueeze(0).repeat(len(actions), 1)
+        elif state.dim() == 2 and state.shape[0] == 1:
+            states = state.repeat(len(actions), 1)
+        else:
+            states = state
+
+        action_tensor = torch.tensor(actions, dtype=torch.long, device=self.device)
+        return network(states, action_tensor)
+
     def select_action(self, state, legal_actions, training=True):
         legal_actions = list(legal_actions)
         if training and self._rng.random() < self.current_epsilon:
             return self._rng.choice(legal_actions)
 
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            q_values = self.q_network(state_tensor).squeeze(0)
+            q_values = self._q_values_for_actions(self.q_network, state_tensor, legal_actions)
 
-        best_action = legal_actions[0]
-        best_value = q_values[best_action].item()
-        for action in legal_actions[1:]:
-            value = q_values[action].item()
-            if value > best_value:
-                best_action = action
-                best_value = value
-        return best_action
+        best_index = int(torch.argmax(q_values).item())
+        return legal_actions[best_index]
 
     def observe_transition(self, state, action, reward, next_state, next_legal_actions, done, training=True):
         if not training:
@@ -492,19 +567,22 @@ class DQNAgent:
         actions = torch.tensor([item.action for item in batch], dtype=torch.long, device=self.device)
         rewards = torch.tensor([item.reward for item in batch], dtype=torch.float32, device=self.device)
         dones = torch.tensor([float(item.done) for item in batch], dtype=torch.float32, device=self.device)
-        next_states = torch.tensor([item.next_state for item in batch], dtype=torch.float32, device=self.device)
 
-        predicted_q = self.q_network(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        predicted_q = self.q_network(states, actions)
 
         with torch.no_grad():
-            next_q_values = self.target_network(next_states)
             max_next_q_values = []
-            for row, item in zip(next_q_values, batch):
+            for item in batch:
                 if item.done or not item.next_actions:
                     max_next_q_values.append(0.0)
                 else:
-                    indexes = torch.tensor(item.next_actions, dtype=torch.long, device=self.device)
-                    max_next_q_values.append(torch.max(row[indexes]).item())
+                    next_state_tensor = torch.tensor(item.next_state, dtype=torch.float32, device=self.device)
+                    next_values = self._q_values_for_actions(
+                        self.target_network,
+                        next_state_tensor,
+                        item.next_actions,
+                    )
+                    max_next_q_values.append(torch.max(next_values).item())
             max_next_q_values = torch.tensor(max_next_q_values, dtype=torch.float32, device=self.device)
             targets = rewards + (1.0 - dones) * self.gamma * max_next_q_values
 
@@ -875,7 +953,8 @@ def train_agent(
             print(
                 f"Episode {episode + 1:4d} | avg reward "
                 f"{sum(recent_rewards) / len(recent_rewards):6.3f} | "
-                f"win rate {sum(recent_wins) / len(recent_wins):5.1%}"
+                f"win rate {sum(recent_wins) / len(recent_wins):5.1%}",
+                flush=True,
             )
 
     return {
@@ -933,14 +1012,16 @@ def compare_agents(
     eval_episodes=30,
     max_steps=None,
     plot_window=DEFAULT_PLOT_WINDOW,
+    report_every=25,
 ):
     results = {}
     for offset, (name, builder) in enumerate(agent_builders.items()):
-        print(f"\nTraining {name} ...")
+        print(f"\nTraining {name} ...", flush=True)
         training = train_agent(
             builder,
             env_config,
             episodes=train_episodes,
+            report_every=report_every,
             max_steps=max_steps,
             base_seed=1_000 * offset,
             plot_window=plot_window,
